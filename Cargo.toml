@@ -1,0 +1,14 @@
+[package]
+name = "array-has-slow"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+datafusion = "41.0.0"
+rand = "0.8.5"
+datafusion-functions-json = "0.41.0"
+tokio = { version = "1.39.3", features = ["full"] }
+
+[profile.profiling]
+inherits = "release"
+debug = true
