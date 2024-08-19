@@ -1,15 +1,17 @@
-use std::any::Any;
-use datafusion::arrow::array::{BooleanArray, LargeStringArray, LargeStringBuilder, RecordBatch};
+use ahash::AHashSet;
+use datafusion::arrow::array::{
+    Array, BooleanArray, LargeStringArray, LargeStringBuilder, RecordBatch, StringArray,
+};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::error::ArrowError;
 use datafusion::arrow::util::pretty::print_batches;
-use datafusion::common::{exec_err, Result as DataFusionResult};
+use datafusion::common::{exec_err, Result as DataFusionResult, ScalarValue};
+use datafusion::logical_expr::{ColumnarValue, ScalarUDF, ScalarUDFImpl, Signature, Volatility};
 use datafusion::prelude::SessionContext;
 use rand::{thread_rng, Rng};
+use std::any::Any;
 use std::sync::Arc;
 use std::time::Instant;
-use ahash::AHashSet;
-use datafusion::logical_expr::{ColumnarValue, ScalarUDF, ScalarUDFImpl, Signature, Volatility};
 
 #[tokio::main]
 async fn main() {
@@ -19,23 +21,41 @@ async fn main() {
 async fn run() -> DataFusionResult<()> {
     let mut ctx = SessionContext::new();
     datafusion_functions_json::register_all(&mut ctx)?;
+    const HAYSTACK_SIZE: usize = 20;
 
-    let names = COMMON_NAMES.iter().take(20).map(|s| s.to_string()).collect::<AHashSet<_>>();
-    let udf = ScalarUDF::from(InSet::new(names));
+    let udf = ScalarUDF::from(InSet::new());
     ctx.register_udf(udf);
 
     let batch = create_batch()?;
     ctx.register_batch(&"test", batch)?;
 
-    let first_x_names = COMMON_NAMES.iter().take(20).map(|s| format!("'{s}'")).collect::<Vec<_>>().join(", ");
+    let first_x_names = COMMON_NAMES
+        .iter()
+        .take(HAYSTACK_SIZE)
+        .map(|s| format!("'{s}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
 
-    run_sql(&ctx, &format!("SELECT count(*) FROM test where trace_id in ({first_x_names})")) .await?;
+    run_sql(
+        &ctx,
+        &format!("SELECT count(*) FROM test where trace_id in ({first_x_names})"),
+    )
+    .await?;
 
-    let ors = COMMON_NAMES.iter().take(20).map(|s| format!("trace_id='{s}'")).collect::<Vec<_>>().join(" OR ");
+    let ors = COMMON_NAMES
+        .iter()
+        .take(HAYSTACK_SIZE)
+        .map(|s| format!("trace_id='{s}'"))
+        .collect::<Vec<_>>()
+        .join(" OR ");
 
-    run_sql(&ctx, &format!("SELECT count(*) FROM test where {ors}")) .await?;
+    run_sql(&ctx, &format!("SELECT count(*) FROM test where {ors}")).await?;
 
-    run_sql(&ctx, "SELECT count(*) FROM test where in_set(trace_id)") .await?;
+    run_sql(
+        &ctx,
+        &format!("SELECT count(*) FROM test where in_set(trace_id, [{first_x_names}])"),
+    )
+    .await?;
     Ok(())
 }
 
@@ -50,18 +70,21 @@ async fn run_sql(ctx: &SessionContext, sql: &str) -> DataFusionResult<()> {
     Ok(())
 }
 
-
 #[derive(Debug)]
 struct InSet {
     signature: Signature,
-    haystack: AHashSet<String>,
 }
 
 impl InSet {
-    fn new(haystack: AHashSet<String>) -> Self {
+    fn new() -> Self {
         Self {
-            signature: Signature::exact(vec![DataType::LargeUtf8], Volatility::Immutable),
-            haystack,
+            signature: Signature::exact(
+                vec![
+                    DataType::LargeUtf8,
+                    DataType::List(Arc::new(Field::new("item", DataType::Utf8, false))),
+                ],
+                Volatility::Immutable,
+            ),
         }
     }
 }
@@ -85,19 +108,27 @@ impl ScalarUDFImpl for InSet {
 
     fn invoke(&self, args: &[ColumnarValue]) -> DataFusionResult<ColumnarValue> {
         let Some(ColumnarValue::Array(needles)) = args.first() else {
-            return exec_err!("in_set expects 1 argument, got no arguments");
+            return exec_err!("in_set expects 2 argument, got no arguments");
         };
         let Some(needles) = needles.as_any().downcast_ref::<LargeStringArray>() else {
-            return exec_err!(
-                "in_set expects 1 string argument, got a non string array"
-            );
+            return exec_err!("in_set expects 2 string argument, got a non string array");
         };
-        let a = BooleanArray::from_unary(needles, |needle| self.haystack.contains(needle));
+
+        let Some(ColumnarValue::Scalar(ScalarValue::List(list))) = args.get(1) else {
+            return exec_err!("in_set expects 2 argument, got one argument");
+        };
+        let items = list.iter().next().unwrap().unwrap();
+        let items = items.as_any().downcast_ref::<StringArray>().unwrap();
+        let haystack = items
+            .iter()
+            .filter_map(|v| v.map(|s| s.to_string()))
+            .collect::<AHashSet<_>>();
+        let a = BooleanArray::from_unary(needles, |needle| haystack.contains(needle));
         Ok(ColumnarValue::Array(Arc::new(a)))
     }
 }
 
-const ROWS: usize = 100_000;
+const ROWS: usize = 10_000;
 
 fn create_batch() -> Result<RecordBatch, ArrowError> {
     let mut rng = thread_rng();
@@ -110,12 +141,12 @@ fn create_batch() -> Result<RecordBatch, ArrowError> {
     }
 
     RecordBatch::try_new(
-        Arc::new(Schema::new(vec![
-            Field::new("trace_id", DataType::LargeUtf8, true),
-        ])),
-        vec![
-            Arc::new(str_builder.finish()),
-        ],
+        Arc::new(Schema::new(vec![Field::new(
+            "trace_id",
+            DataType::LargeUtf8,
+            true,
+        )])),
+        vec![Arc::new(str_builder.finish())],
     )
 }
 
