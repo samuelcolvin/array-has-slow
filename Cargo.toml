@@ -8,6 +8,7 @@ datafusion = "41.0.0"
 rand = "0.8.5"
 datafusion-functions-json = "0.41.0"
 tokio = { version = "1.39.3", features = ["full"] }
+ahash = "0.8.11"
 
 [profile.profiling]
 inherits = "release"

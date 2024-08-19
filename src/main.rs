@@ -1,12 +1,15 @@
-use datafusion::arrow::array::{ListBuilder, RecordBatch, StringBuilder};
+use std::any::Any;
+use datafusion::arrow::array::{BooleanArray, LargeStringArray, LargeStringBuilder, RecordBatch};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::error::ArrowError;
 use datafusion::arrow::util::pretty::print_batches;
-use datafusion::common::Result as DataFusionResult;
+use datafusion::common::{exec_err, Result as DataFusionResult};
 use datafusion::prelude::SessionContext;
 use rand::{thread_rng, Rng};
 use std::sync::Arc;
 use std::time::Instant;
+use ahash::AHashSet;
+use datafusion::logical_expr::{ColumnarValue, ScalarUDF, ScalarUDFImpl, Signature, Volatility};
 
 #[tokio::main]
 async fn main() {
@@ -17,20 +20,22 @@ async fn run() -> DataFusionResult<()> {
     let mut ctx = SessionContext::new();
     datafusion_functions_json::register_all(&mut ctx)?;
 
+    let names = COMMON_NAMES.iter().take(20).map(|s| s.to_string()).collect::<AHashSet<_>>();
+    let udf = ScalarUDF::from(InSet::new(names));
+    ctx.register_udf(udf);
+
     let batch = create_batch()?;
     ctx.register_batch(&"test", batch)?;
 
-    run_sql(
-        &ctx,
-        "SELECT count(*) FROM test where json_contains(json, 'service.name')",
-    )
-    .await?;
-    run_sql(
-        &ctx,
-        "SELECT count(*) FROM test where array_has(list, 'service.name')",
-    )
-    .await?;
-    // run_sql(&ctx, "SELECT count(*) FROM test where json ? 'service.name'")?;
+    let first_x_names = COMMON_NAMES.iter().take(20).map(|s| format!("'{s}'")).collect::<Vec<_>>().join(", ");
+
+    run_sql(&ctx, &format!("SELECT count(*) FROM test where trace_id in ({first_x_names})")) .await?;
+
+    let ors = COMMON_NAMES.iter().take(20).map(|s| format!("trace_id='{s}'")).collect::<Vec<_>>().join(" OR ");
+
+    run_sql(&ctx, &format!("SELECT count(*) FROM test where {ors}")) .await?;
+
+    run_sql(&ctx, "SELECT count(*) FROM test where in_set(trace_id)") .await?;
     Ok(())
 }
 
@@ -45,48 +50,71 @@ async fn run_sql(ctx: &SessionContext, sql: &str) -> DataFusionResult<()> {
     Ok(())
 }
 
+
+#[derive(Debug)]
+struct InSet {
+    signature: Signature,
+    haystack: AHashSet<String>,
+}
+
+impl InSet {
+    fn new(haystack: AHashSet<String>) -> Self {
+        Self {
+            signature: Signature::exact(vec![DataType::LargeUtf8], Volatility::Immutable),
+            haystack,
+        }
+    }
+}
+
+impl ScalarUDFImpl for InSet {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        "in_set"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _: &[DataType]) -> DataFusionResult<DataType> {
+        Ok(DataType::Boolean)
+    }
+
+    fn invoke(&self, args: &[ColumnarValue]) -> DataFusionResult<ColumnarValue> {
+        let Some(ColumnarValue::Array(needles)) = args.first() else {
+            return exec_err!("in_set expects 1 argument, got no arguments");
+        };
+        let Some(needles) = needles.as_any().downcast_ref::<LargeStringArray>() else {
+            return exec_err!(
+                "in_set expects 1 string argument, got a non string array"
+            );
+        };
+        let a = BooleanArray::from_unary(needles, |needle| self.haystack.contains(needle));
+        Ok(ColumnarValue::Array(Arc::new(a)))
+    }
+}
+
 const ROWS: usize = 100_000;
 
 fn create_batch() -> Result<RecordBatch, ArrowError> {
     let mut rng = thread_rng();
 
-    let mut json_builder = StringBuilder::with_capacity(ROWS, ROWS * 100);
-
-    let mut keys_builder =
-        ListBuilder::with_capacity(StringBuilder::with_capacity(ROWS, ROWS * 10), ROWS * 10);
+    let mut str_builder = LargeStringBuilder::with_capacity(ROWS, ROWS * 100);
 
     for _ in 0..ROWS {
-        let mut json = String::new();
-        json.push_str("{");
-        for i in 0..rng.gen_range(2..=18) {
-            if json.len() > 1 {
-                json.push_str(",");
-            }
-            json.push('"');
-            let key = COMMON_NAMES[rng.gen_range(0..COMMON_NAMES.len())];
-            keys_builder.values().append_value(key);
-
-            json.push_str(key);
-            json.push_str(r#"": "#);
-            json.push_str(&i.to_string());
-        }
-        json.push(']');
-        json_builder.append_value(&json);
-        keys_builder.append(true);
+        let name = COMMON_NAMES[rng.gen_range(0..COMMON_NAMES.len())];
+        str_builder.append_value(name);
     }
 
     RecordBatch::try_new(
         Arc::new(Schema::new(vec![
-            Field::new("json", DataType::Utf8, true),
-            Field::new(
-                "list",
-                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
-                true,
-            ),
+            Field::new("trace_id", DataType::LargeUtf8, true),
         ])),
         vec![
-            Arc::new(json_builder.finish()),
-            Arc::new(keys_builder.finish()),
+            Arc::new(str_builder.finish()),
         ],
     )
 }

@@ -80,6 +80,7 @@ dependencies = [
 name = "array-has-slow"
 version = "0.1.0"
 dependencies = [
+ "ahash",
  "datafusion",
  "datafusion-functions-json",
  "rand",
